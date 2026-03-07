@@ -1,0 +1,569 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ollama-update - Check and update Ollama models, rebuild custom Modelfiles if needed
+#
+# Usage:
+#   ollama-update                              # Check only (dry run)
+#   ollama-update --update                     # Pull updates and rebuild Modelfiles
+#   ollama-update --json                       # Output check results as JSON
+#   ollama-update --quiet                      # Only show UPDATE/SKIP lines
+#   ollama-update --update --defer-reload      # Update but skip VRAM reload
+#   ollama-update --pin model1,model2          # Skip pinned models
+#   ollama-update --config /path/to/config     # Use alternate config file
+#   ollama-update --endpoint http://host:11434 # Use alternate Ollama endpoint
+#   ollama-update --modelfile-dir /path/to/dir # Use alternate Modelfile directory
+#   ollama-update --jobs N                     # Parallel check jobs (default: unlimited)
+
+# Defaults
+CONFIG_FILE="${HOME}/.config/ollama-update/config"
+MODELFILE_DIR="${HOME}/.config/ollama-update/modelfiles"
+OLLAMA_ENDPOINT="http://localhost:11434"
+PINNED_MODELS=""
+UPDATE=false
+JSON=false
+QUIET=false
+DEFER_RELOAD=false
+MAX_JOBS=0  # 0 = unlimited (all models at once)
+SPAWN_DELAY=0
+
+# CLI overrides — stored as parallel arrays to avoid eval
+declare -a CLI_OVERRIDE_KEYS=()
+declare -a CLI_OVERRIDE_VALS=()
+
+die() { echo "Error: $1" >&2; exit 2; }
+
+# Require a value argument for the given flag
+require_arg() {
+    local flag="$1" idx="$2" max="$3"
+    [[ $idx -lt $max ]] || die "$flag requires a value"
+}
+
+# First pass: extract --config and collect all CLI overrides
+args=("$@")
+i=0
+while [[ $i -lt ${#args[@]} ]]; do
+    case "${args[$i]}" in
+        --config)
+            i=$((i + 1)); require_arg --config "$i" "${#args[@]}"
+            CONFIG_FILE="${args[$i]}"
+            ;;
+        --modelfile-dir)
+            i=$((i + 1)); require_arg --modelfile-dir "$i" "${#args[@]}"
+            CLI_OVERRIDE_KEYS+=("MODELFILE_DIR"); CLI_OVERRIDE_VALS+=("${args[$i]}")
+            ;;
+        --endpoint)
+            i=$((i + 1)); require_arg --endpoint "$i" "${#args[@]}"
+            CLI_OVERRIDE_KEYS+=("OLLAMA_ENDPOINT"); CLI_OVERRIDE_VALS+=("${args[$i]}")
+            ;;
+        --pin)
+            i=$((i + 1)); require_arg --pin "$i" "${#args[@]}"
+            CLI_OVERRIDE_KEYS+=("PINNED_MODELS"); CLI_OVERRIDE_VALS+=("${args[$i]}")
+            ;;
+        --jobs)
+            i=$((i + 1)); require_arg --jobs "$i" "${#args[@]}"
+            [[ "${args[$i]}" =~ ^[0-9]+$ ]] || die "--jobs must be a positive integer"
+            CLI_OVERRIDE_KEYS+=("MAX_JOBS"); CLI_OVERRIDE_VALS+=("${args[$i]}")
+            ;;
+        --update) CLI_OVERRIDE_KEYS+=("UPDATE"); CLI_OVERRIDE_VALS+=("true") ;;
+        --json) CLI_OVERRIDE_KEYS+=("JSON"); CLI_OVERRIDE_VALS+=("true") ;;
+        --quiet) CLI_OVERRIDE_KEYS+=("QUIET"); CLI_OVERRIDE_VALS+=("true") ;;
+        --defer-reload) CLI_OVERRIDE_KEYS+=("DEFER_RELOAD"); CLI_OVERRIDE_VALS+=("true") ;;
+        -h|--help)
+            cat <<'HELPEOF'
+Usage: ollama-update [options]
+  --update                Pull updates and rebuild custom Modelfiles
+  --json                  Output results as JSON
+  --quiet                 Only show UPDATE and SKIP lines (suppress OK/PIN)
+  --defer-reload          Skip reloading updated models in VRAM (cold-load on next use)
+  --config <path>         Config file (default: ~/.config/ollama-update/config)
+  --modelfile-dir <path>  Custom Modelfile directory
+  --endpoint <url>        Ollama API endpoint (default: http://localhost:11434)
+  --pin <models>          Comma-separated models to skip (pin current version)
+  --jobs <N>              Parallel digest check jobs (default: unlimited)
+
+Exit codes: 0 = all up to date, 1 = updates available, 2 = usage error
+HELPEOF
+            exit 0
+            ;;
+        *) die "unknown option: ${args[$i]}" ;;
+    esac
+    i=$((i + 1))
+done
+
+# Source config file (if it exists)
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+# Re-apply CLI overrides (CLI > config > defaults) — safe direct assignment
+for ((k=0; k<${#CLI_OVERRIDE_KEYS[@]}; k++)); do
+    case "${CLI_OVERRIDE_KEYS[$k]}" in
+        MODELFILE_DIR)    MODELFILE_DIR="${CLI_OVERRIDE_VALS[$k]}" ;;
+        OLLAMA_ENDPOINT)  OLLAMA_ENDPOINT="${CLI_OVERRIDE_VALS[$k]}" ;;
+        PINNED_MODELS)    PINNED_MODELS="${CLI_OVERRIDE_VALS[$k]}" ;;
+        MAX_JOBS)         MAX_JOBS="${CLI_OVERRIDE_VALS[$k]}" ;;
+        UPDATE)           UPDATE="${CLI_OVERRIDE_VALS[$k]}" ;;
+        JSON)             JSON="${CLI_OVERRIDE_VALS[$k]}" ;;
+        QUIET)            QUIET="${CLI_OVERRIDE_VALS[$k]}" ;;
+        DEFER_RELOAD)     DEFER_RELOAD="${CLI_OVERRIDE_VALS[$k]}" ;;
+    esac
+done
+
+# Check required dependencies
+for cmd in curl jq ollama; do
+    command -v "$cmd" >/dev/null 2>&1 || die "$cmd is required but not found in PATH"
+done
+
+# Export OLLAMA_HOST so ollama pull/create honor --endpoint
+export OLLAMA_HOST="$OLLAMA_ENDPOINT"
+
+REGISTRY="https://registry.ollama.ai/v2/library"
+UPDATED_BASES=()
+REBUILT_CUSTOMS=()
+RESULTS=()
+
+# Temp dir for parallel check results
+TMPDIR_CHECK=$(mktemp -d)
+trap 'rm -rf "$TMPDIR_CHECK"' EXIT
+
+# Snapshot currently loaded models: name -> expires_at (ISO timestamp)
+declare -A LOADED_MODELS
+while IFS=$'\t' read -r lm_name lm_expires; do
+    LOADED_MODELS["$lm_name"]="$lm_expires"
+done < <(curl -s "${OLLAMA_ENDPOINT}/api/ps" 2>/dev/null \
+    | jq -r '.models[]? | "\(.name)\t\(.expires_at // "")"' 2>/dev/null)
+
+# Get local model weight blob digest via API
+get_local_digest() {
+    local model="$1"
+    curl -s "${OLLAMA_ENDPOINT}/api/show" -d "{\"name\":\"$model\"}" 2>/dev/null \
+        | jq -r '(.modelfile // "" | capture("sha256-(?<h>[a-f0-9]+)"))? // empty | "sha256:" + .h' 2>/dev/null
+}
+
+# Get remote model weight blob digest from registry manifest
+get_remote_digest() {
+    local lib="$1" tag="$2"
+    local url
+    if [[ "$lib" == *"/"* ]]; then
+        url="https://registry.ollama.ai/v2/${lib}/manifests/${tag}"
+    else
+        url="${REGISTRY}/${lib}/manifests/${tag}"
+    fi
+    curl -s --max-time 10 \
+        -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+        "$url" 2>/dev/null \
+        | jq -r '[.layers[]? | select(.mediaType | contains("model"))] | first | .digest // empty' 2>/dev/null
+}
+
+# Parse model name into library and tag
+parse_model() {
+    local model="$1"
+    local lib="${model%%:*}"
+    local tag="${model##*:}"
+    [[ "$tag" == "$lib" ]] && tag="latest"
+    echo "$lib" "$tag"
+}
+
+# Build map of custom Modelfiles: custom_name -> base_model
+declare -A CUSTOM_MODELS
+if [[ -d "$MODELFILE_DIR" ]]; then
+    for mf in "$MODELFILE_DIR"/Modelfile-*; do
+        [[ -f "$mf" ]] || continue
+        custom_name="${mf##*/Modelfile-}"
+        base_model=$(grep "^FROM " "$mf" | head -1 | awk '{print $2}')
+        if [[ -n "$base_model" ]]; then
+            CUSTOM_MODELS["$custom_name"]="$base_model"
+        fi
+    done
+fi
+
+# Get model list via API (respects --endpoint for remote checks)
+get_model_list() {
+    curl -sf --max-time 5 "${OLLAMA_ENDPOINT}/api/tags" 2>/dev/null \
+        | jq -r '.models[]?.name' 2>/dev/null | sort -u
+}
+
+# Verify endpoint is reachable before proceeding
+if ! curl -sf --max-time 5 "${OLLAMA_ENDPOINT}/api/tags" >/dev/null 2>&1; then
+    die "cannot reach Ollama at ${OLLAMA_ENDPOINT}"
+fi
+
+model_count=$(get_model_list | wc -l)
+if ! $QUIET && ! $JSON; then
+    jobs_display="unlimited"; [[ $MAX_JOBS -gt 0 ]] && jobs_display="$MAX_JOBS"
+    echo "Checking ${model_count} models against registry (${jobs_display} parallel)..."
+    echo ""
+fi
+
+# ── Phase 1: Categorize models (synchronous, instant) ──
+declare -a CHECK_MODELS=()
+declare -a CHECK_MODES=()
+idx=0
+
+while IFS= read -r model; do
+    [[ -z "$model" ]] && continue
+    read -r lib tag <<< "$(parse_model "$model")"
+
+    # Check if model is pinned
+    if [[ -n "$PINNED_MODELS" ]]; then
+        IFS=',' read -ra _pins <<< "$PINNED_MODELS"
+        _pinned=false
+        for _p in "${_pins[@]}"; do
+            if [[ "$model" == "$_p" || "$lib" == "$_p" ]]; then
+                _pinned=true
+                break
+            fi
+        done
+        if $_pinned; then
+            echo "PIN|$model|pinned" > "${TMPDIR_CHECK}/${idx}"
+            CHECK_MODELS[$idx]="$model"
+            CHECK_MODES[$idx]="done"
+            idx=$((idx + 1))
+            continue
+        fi
+    fi
+
+    # Custom Modelfile-based model — resolve base before spawning worker
+    custom_key=""
+    if [[ -n "${CUSTOM_MODELS[$model]+x}" ]]; then
+        custom_key="$model"
+    elif [[ "$tag" == "latest" && -n "${CUSTOM_MODELS[$lib]+x}" ]]; then
+        custom_key="$lib"
+    fi
+    if [[ -n "$custom_key" ]]; then
+        base="${CUSTOM_MODELS[$custom_key]}"
+        read -r base_lib base_tag <<< "$(parse_model "$base")"
+        CHECK_MODELS[$idx]="$model"
+        CHECK_MODES[$idx]="custom:${base_lib}:${base_tag}:${base}"
+        idx=$((idx + 1))
+        continue
+    fi
+
+    # Standard model — needs digest check
+    CHECK_MODELS[$idx]="$model"
+    CHECK_MODES[$idx]="standard"
+    idx=$((idx + 1))
+done < <(get_model_list)
+
+total=$idx
+
+# ── Phase 2: Parallel digest checks ──
+# Worker function — runs in background, writes result to temp file
+check_model_worker() {
+    local widx="$1" wmodel="$2" wmode="$3"
+    local result=""
+
+    if [[ "$wmode" == custom:* ]]; then
+        IFS=: read -r _ base_lib base_tag base <<< "$wmode"
+        local base_local base_remote
+        base_local=$(get_local_digest "$base")
+        base_remote=$(get_remote_digest "$base_lib" "$base_tag")
+        if [[ -z "$base_remote" ]]; then
+            result="SKIP|$wmodel|custom_base_not_in_registry"
+        elif [[ -n "$base_local" && "$base_local" != "$base_remote" ]]; then
+            result="UPDATE|$wmodel|custom"
+        elif [[ "$(get_local_digest "$wmodel")" != "$(get_local_digest "$base")" ]]; then
+            result="UPDATE|$wmodel|custom"
+        else
+            result="OK|$wmodel|custom"
+        fi
+    else
+        local local_digest remote_digest wlib wtag
+        read -r wlib wtag <<< "$(parse_model "$wmodel")"
+        local_digest=$(get_local_digest "$wmodel")
+        if [[ -z "$local_digest" ]]; then
+            result="SKIP|$wmodel|no_modelfile"
+        else
+            remote_digest=$(get_remote_digest "$wlib" "$wtag")
+            if [[ -z "$remote_digest" ]]; then
+                result="SKIP|$wmodel|not_in_registry"
+            elif [[ "$local_digest" == "$remote_digest" ]]; then
+                result="OK|$wmodel|"
+            else
+                result="UPDATE|$wmodel|"
+            fi
+        fi
+    fi
+    echo "$result" > "${TMPDIR_CHECK}/${widx}"
+}
+
+# Print a single result line and append to RESULTS[]
+print_result() {
+    local j="$1"
+    local result_file="${TMPDIR_CHECK}/${j}"
+    [[ -f "$result_file" ]] || return 1
+    local result
+    result=$(< "$result_file")
+    RESULTS+=("$result")
+
+    $JSON && return 0
+
+    local status model reason
+    IFS='|' read -r status model reason <<< "$result"
+
+    # Quiet mode: only show UPDATE and SKIP
+    if $QUIET; then
+        case "$status" in
+            OK|PIN) return 0 ;;
+        esac
+    fi
+
+    case "$status" in
+        PIN)    echo "PIN   $model" ;;
+        SKIP)
+            case "$reason" in
+                custom_base_not_in_registry)
+                    if [[ "${CHECK_MODES[$j]}" == custom:* ]]; then
+                        IFS=: read -r _ _ _ base <<< "${CHECK_MODES[$j]}"
+                        echo "SKIP  $model (custom: base $base not in registry)"
+                    else
+                        echo "SKIP  $model ($reason)"
+                    fi
+                    ;;
+                no_modelfile) echo "SKIP  $model (unknown, no modelfile)" ;;
+                not_in_registry) echo "SKIP  $model (not in registry)" ;;
+                *) echo "SKIP  $model${reason:+ ($reason)}" ;;
+            esac
+            ;;
+        OK)
+            if [[ "$reason" == "custom" ]]; then
+                if [[ "${CHECK_MODES[$j]}" == custom:* ]]; then
+                    IFS=: read -r _ _ _ base <<< "${CHECK_MODES[$j]}"
+                    echo "OK    $model (custom: base $base up to date)"
+                else
+                    echo "OK    $model (custom)"
+                fi
+            else
+                echo "OK    $model"
+            fi
+            ;;
+        UPDATE)
+            if [[ "$reason" == "custom" ]]; then
+                if [[ "${CHECK_MODES[$j]}" == custom:* ]]; then
+                    IFS=: read -r _ _ _ base <<< "${CHECK_MODES[$j]}"
+                    echo "UPDATE $model (custom: base $base has update)"
+                else
+                    echo "UPDATE $model (custom)"
+                fi
+            else
+                echo "UPDATE $model"
+            fi
+            ;;
+    esac
+}
+
+# Export functions and vars needed by subshells
+export OLLAMA_ENDPOINT REGISTRY TMPDIR_CHECK
+export -f check_model_worker get_local_digest get_remote_digest parse_model
+
+# ── Phase 2.5: Stream results as they complete ──
+declare -A PRINTED=()
+printed_count=0
+
+# Print "done" (pinned) results immediately — they already have temp files
+for ((j=0; j<total; j++)); do
+    [[ "${CHECK_MODES[$j]}" == "done" ]] || continue
+    print_result "$j"
+    PRINTED[$j]=1
+    printed_count=$((printed_count + 1))
+done
+
+# Background: launch workers + throttle
+(
+    job_count=0
+    for ((j=0; j<total; j++)); do
+        [[ "${CHECK_MODES[$j]}" == "done" ]] && continue
+        check_model_worker "$j" "${CHECK_MODELS[$j]}" "${CHECK_MODES[$j]}" &
+        job_count=$((job_count + 1))
+        [[ "$SPAWN_DELAY" != "0" ]] && sleep "$SPAWN_DELAY"
+        if [[ $MAX_JOBS -gt 0 && $job_count -ge $MAX_JOBS ]]; then
+            wait -n 2>/dev/null || true
+            job_count=$((job_count - 1))
+        fi
+    done
+    wait
+    touch "${TMPDIR_CHECK}/ALL_DONE"
+) &
+launcher_pid=$!
+
+# Update trap to clean up background launcher
+trap 'kill "$launcher_pid" 2>/dev/null || true; rm -rf "$TMPDIR_CHECK"' EXIT
+
+# Foreground: print results as they appear
+while [[ $printed_count -lt $total ]]; do
+    found_any=false
+    for ((j=0; j<total; j++)); do
+        [[ -n "${PRINTED[$j]+x}" ]] && continue
+        [[ -f "${TMPDIR_CHECK}/${j}" ]] || continue
+        print_result "$j"
+        PRINTED[$j]=1
+        printed_count=$((printed_count + 1))
+        found_any=true
+    done
+    if [[ $printed_count -lt $total ]]; then
+        # All jobs finished but some results missing = error, stop waiting
+        if [[ -f "${TMPDIR_CHECK}/ALL_DONE" ]] && ! $found_any; then
+            break
+        fi
+        sleep 0.05
+    fi
+done
+
+# ── Phase 4: Sequential updates ──
+if $UPDATE; then
+    for r in "${RESULTS[@]}"; do
+        IFS='|' read -r status model reason <<< "$r"
+        [[ "$status" == "UPDATE" ]] || continue
+
+        # Find the CHECK_MODES index for this model to get custom base info
+        for ((j=0; j<total; j++)); do
+            [[ "${CHECK_MODELS[$j]}" == "$model" ]] && break
+        done
+
+        if [[ "$reason" == "custom" && "${CHECK_MODES[$j]}" == custom:* ]]; then
+            IFS=: read -r _ _ _ base <<< "${CHECK_MODES[$j]}"
+            echo "  -> Pulling base $base..."
+            ollama pull "$base"
+            UPDATED_BASES+=("$base")
+        else
+            echo "  -> Pulling $model..."
+            ollama pull "$model"
+            UPDATED_BASES+=("$model")
+        fi
+    done
+fi
+
+# Rebuild custom Modelfiles if their base was updated
+if $UPDATE && [[ ${#CUSTOM_MODELS[@]} -gt 0 ]]; then
+    echo ""
+    echo "Checking custom Modelfiles..."
+    for custom_name in "${!CUSTOM_MODELS[@]}"; do
+        base="${CUSTOM_MODELS[$custom_name]}"
+        needs_rebuild=false
+
+        # Check if the base model was just updated
+        for updated in "${UPDATED_BASES[@]}"; do
+            if [[ "$updated" == "$base" ]]; then
+                needs_rebuild=true
+                break
+            fi
+        done
+
+        # Even if base wasn't in our update list, check if the custom model's
+        # FROM blob matches the current base model's blob
+        if ! $needs_rebuild; then
+            custom_blob=$(get_local_digest "$custom_name" 2>/dev/null)
+            base_blob=$(get_local_digest "$base" 2>/dev/null)
+            if [[ -n "$custom_blob" && -n "$base_blob" && "$custom_blob" != "$base_blob" ]]; then
+                needs_rebuild=true
+                echo "  $custom_name: base model $base has newer weights than custom model"
+            fi
+        fi
+
+        if $needs_rebuild; then
+            mf="$MODELFILE_DIR/Modelfile-${custom_name}"
+            if [[ -f "$mf" ]]; then
+                echo "  -> Rebuilding $custom_name from $mf..."
+                ollama create "$custom_name" -f "$mf"
+                REBUILT_CUSTOMS+=("$custom_name")
+            else
+                echo "  WARN: No Modelfile found at $mf for $custom_name"
+            fi
+        else
+            echo "  OK  $custom_name (base $base unchanged)"
+        fi
+    done
+fi
+
+# Reload updated models that were loaded in VRAM
+if $UPDATE && ! $DEFER_RELOAD && [[ ${#LOADED_MODELS[@]} -gt 0 ]]; then
+    reload_needed=false
+    for lm_name in "${!LOADED_MODELS[@]}"; do
+        was_updated=false
+        for updated in "${UPDATED_BASES[@]}"; do
+            [[ "$updated" == "$lm_name" ]] && was_updated=true && break
+        done
+        if ! $was_updated; then
+            for rebuilt in "${REBUILT_CUSTOMS[@]}"; do
+                [[ "$rebuilt" == "$lm_name" ]] && was_updated=true && break
+            done
+        fi
+        if $was_updated; then
+            if ! $reload_needed; then
+                echo ""
+                echo "Reloading updated models in VRAM..."
+                reload_needed=true
+            fi
+            expires_at="${LOADED_MODELS[$lm_name]}"
+            exp_epoch=$(date -d "$expires_at" +%s 2>/dev/null) || exp_epoch=0
+            now_epoch=$(date +%s)
+            keep_alive=$(( exp_epoch - now_epoch ))
+            [[ $keep_alive -lt 1 ]] && keep_alive=-1
+            echo "  -> Unloading $lm_name..."
+            curl -s "${OLLAMA_ENDPOINT}/api/generate" -d "{\"model\":\"$lm_name\",\"keep_alive\":0}" >/dev/null 2>&1
+            echo "  -> Reloading $lm_name (keep_alive: ${keep_alive}s)..."
+            curl -s "${OLLAMA_ENDPOINT}/api/generate" -d "{\"model\":\"$lm_name\",\"keep_alive\":$keep_alive}" >/dev/null 2>&1
+            echo "  OK  $lm_name reloaded"
+        fi
+    done
+elif $UPDATE && $DEFER_RELOAD && [[ ${#LOADED_MODELS[@]} -gt 0 ]]; then
+    echo ""
+    echo "Reload deferred — updated models will cold-load on next use."
+fi
+
+# ── Summary ──
+count_ok=0; count_update=0; count_skip=0; count_pin=0
+for r in "${RESULTS[@]}"; do
+    IFS='|' read -r s _ _ <<< "$r"
+    case "$s" in
+        OK)     count_ok=$((count_ok + 1)) ;;
+        UPDATE) count_update=$((count_update + 1)) ;;
+        PIN)    count_pin=$((count_pin + 1)) ;;
+        SKIP)   count_skip=$((count_skip + 1)) ;;
+    esac
+done
+
+elapsed="${SECONDS}.0"
+
+# Exit code: 1=updates available, 0=all ok (SKIPs are expected, not errors)
+exit_code=0
+if [[ $count_update -gt 0 ]]; then
+    # --update mode: exit 0 after successful pulls (updates were applied)
+    if $UPDATE; then
+        exit_code=0
+    else
+        exit_code=1
+    fi
+fi
+
+# JSON output
+if $JSON; then
+    echo "{"
+    echo "  \"results\": ["
+    for i in "${!RESULTS[@]}"; do
+        IFS='|' read -r status model reason <<< "${RESULTS[$i]}"
+        comma=","
+        [[ $i -eq $((${#RESULTS[@]}-1)) ]] && comma=""
+        echo "    {\"status\": \"$status\", \"model\": \"$model\"${reason:+, \"reason\": \"$reason\"}}$comma"
+    done
+    echo "  ],"
+    echo "  \"summary\": {"
+    echo "    \"total\": ${#RESULTS[@]},"
+    echo "    \"ok\": $count_ok,"
+    echo "    \"update\": $count_update,"
+    echo "    \"skip\": $count_skip,"
+    echo "    \"pin\": $count_pin,"
+    echo "    \"elapsed_s\": $elapsed"
+    echo "  }"
+    echo "}"
+else
+    echo ""
+    echo "Done: $count_ok ok, $count_update update, $count_skip skip, $count_pin pin (${elapsed}s)"
+    if [[ $count_update -gt 0 ]] && ! $UPDATE; then
+        echo "Run with --update to pull updates and rebuild custom Modelfiles."
+    fi
+fi
+
+exit "$exit_code"
