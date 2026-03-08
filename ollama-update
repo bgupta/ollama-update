@@ -559,10 +559,18 @@ if $UPDATE && ! $DEFER_RELOAD && [[ ${#LOADED_MODELS[@]} -gt 0 ]]; then
             keep_alive=$(( exp_epoch - now_epoch ))
             [[ $keep_alive -lt 1 ]] && keep_alive=-1
             echo "  -> Unloading $lm_name..."
-            curl -s "${OLLAMA_ENDPOINT}/api/generate" -d "{\"model\":\"$lm_name\",\"keep_alive\":0}" >/dev/null 2>&1
+            unload_resp=$(curl -s "${OLLAMA_ENDPOINT}/api/generate" -d "{\"model\":\"$lm_name\",\"keep_alive\":0}" 2>/dev/null)
+            if echo "$unload_resp" | jq -e '.error' >/dev/null 2>&1; then
+                echo "  WARN  $lm_name unload failed: $(echo "$unload_resp" | jq -r '.error')"
+                continue
+            fi
             echo "  -> Reloading $lm_name (keep_alive: ${keep_alive}s)..."
-            curl -s "${OLLAMA_ENDPOINT}/api/generate" -d "{\"model\":\"$lm_name\",\"keep_alive\":$keep_alive}" >/dev/null 2>&1
-            echo "  OK  $lm_name reloaded"
+            reload_resp=$(curl -s "${OLLAMA_ENDPOINT}/api/generate" -d "{\"model\":\"$lm_name\",\"keep_alive\":$keep_alive}" 2>/dev/null)
+            if echo "$reload_resp" | jq -e '.error' >/dev/null 2>&1; then
+                echo "  WARN  $lm_name reload failed: $(echo "$reload_resp" | jq -r '.error')"
+            else
+                echo "  OK  $lm_name reloaded"
+            fi
         fi
     done
 elif $UPDATE && $DEFER_RELOAD && [[ ${#LOADED_MODELS[@]} -gt 0 ]]; then
