@@ -87,7 +87,16 @@ cd ollama-update && git pull
 # Re-run the curl command above
 ```
 
-**Requirements:** `bash` 4.3+ (uses `wait -n`), `curl`, `jq`, `ollama`
+**Requirements:** `bash` 4.0+, `curl`, `jq`, `ollama`
+
+## Platform support
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| Linux | Fully supported | Works with system Bash |
+| macOS (Homebrew) | Fully supported | `brew install bash` (Bash 4.0+ required) |
+| macOS (stock) | Not supported | Ships Bash 3.2 -- install via Homebrew |
+| WSL / Windows | Fully supported | Works with system Bash |
 
 ## Configuration
 
