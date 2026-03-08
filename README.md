@@ -57,7 +57,7 @@ ollama-update --json
 |------|---------|
 | `0` | All models up to date (or updates applied with `--update`) |
 | `1` | Updates available (dry run) |
-| `2` | Usage error (bad args, endpoint unreachable) |
+| `2` | Error (bad args, endpoint unreachable, check failures) |
 
 ## Install
 

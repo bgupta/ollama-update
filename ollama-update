@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.1.4"
+VERSION="0.1.5"
 
 if ((BASH_VERSINFO[0] < 4)); then
   echo "Error: ollama-update requires bash 4.0+ (found ${BASH_VERSION})" >&2
@@ -95,7 +95,7 @@ Usage: ollama-update [options]
   --jobs <N>              Parallel digest check jobs (default: unlimited)
   -v, --version           Print version and exit
 
-Exit codes: 0 = all up to date, 1 = updates available, 2 = usage error
+Exit codes: 0 = all up to date, 1 = updates available, 2 = error
 HELPEOF
             exit 0
             ;;
