@@ -84,18 +84,31 @@ while [[ $i -lt ${#args[@]} ]]; do
         -h|--help)
             cat <<'HELPEOF'
 Usage: ollama-update [options]
+Check for Ollama model updates by comparing local digests against the registry.
+
+Actions:
   --update                Pull updates and rebuild custom Modelfiles
+  --defer-reload          Skip reloading updated models in VRAM after update
+
+Output:
   --json                  Output results as JSON
-  --quiet                 Only show UPDATE and SKIP lines (suppress OK/PIN)
-  --defer-reload          Skip reloading updated models in VRAM (cold-load on next use)
+  --quiet                 Only show UPDATE and SKIP lines
+
+Configuration:
   --config <path>         Config file (default: ~/.config/ollama-update/config)
-  --modelfile-dir <path>  Custom Modelfile directory
+  --modelfile-dir <path>  Custom Modelfile directory (default: ~/.config/ollama-update/modelfiles)
   --endpoint <url>        Ollama API endpoint (default: http://localhost:11434)
-  --pin <models>          Comma-separated models to skip (pin current version)
+  --pin <m1,m2,...>       Comma-separated models to skip
   --jobs <N>              Parallel digest check jobs (default: unlimited)
   -v, --version           Print version and exit
 
 Exit codes: 0 = all up to date, 1 = updates available, 2 = error
+
+Examples:
+  ollama-update                              Check for updates (dry run)
+  ollama-update --update                     Pull updates and rebuild
+  ollama-update --endpoint http://gpu:11434  Check a remote instance
+  ollama-update --json --quiet               Machine-readable output
 HELPEOF
             exit 0
             ;;
