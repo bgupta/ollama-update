@@ -149,13 +149,23 @@ done < <(curl -s "${OLLAMA_ENDPOINT}/api/ps" 2>/dev/null \
     | jq -r '.models[]? | "\(.name)\t\(.expires_at // "")"' 2>/dev/null)
 
 # Get local model weight blob digest via API
+# Returns: digest string, empty string (no modelfile), or "ERROR:<message>" on API error
 get_local_digest() {
     local model="$1"
-    curl -s "${OLLAMA_ENDPOINT}/api/show" -d "{\"name\":\"$model\"}" 2>/dev/null \
-        | jq -r '(.modelfile // "" | capture("sha256-(?<h>[a-f0-9]+)"))? // empty | "sha256:" + .h' 2>/dev/null
+    local resp
+    resp=$(curl -s "${OLLAMA_ENDPOINT}/api/show" -d "{\"name\":\"$model\"}" 2>/dev/null) || { echo "ERROR:api_request_failed"; return; }
+    # Check for error field in response (e.g. {"error":"internal failure"})
+    local err
+    err=$(echo "$resp" | jq -r '.error // empty' 2>/dev/null)
+    if [[ -n "$err" ]]; then
+        echo "ERROR:${err}"
+        return
+    fi
+    echo "$resp" | jq -r '(.modelfile // "" | capture("sha256-(?<h>[a-f0-9]+)"))? // empty | "sha256:" + .h' 2>/dev/null
 }
 
 # Get remote model weight blob digest from registry manifest
+# Returns: digest string, empty string (not in registry), or "ERROR:<message>" on API error
 get_remote_digest() {
     local lib="$1" tag="$2"
     local url
@@ -164,10 +174,29 @@ get_remote_digest() {
     else
         url="${REGISTRY}/${lib}/manifests/${tag}"
     fi
-    curl -s --max-time 10 \
+    local resp
+    resp=$(curl -s --max-time 10 \
         -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
-        "$url" 2>/dev/null \
-        | jq -r '[.layers[]? | select(.mediaType | contains("model"))] | first | .digest // empty' 2>/dev/null
+        "$url" 2>/dev/null) || { echo "ERROR:registry_request_failed"; return; }
+    # Check for Docker registry error response (e.g. {"errors":[...]})
+    local has_errors
+    has_errors=$(echo "$resp" | jq -r '.errors // empty | if length > 0 then "yes" else empty end' 2>/dev/null)
+    if [[ -n "$has_errors" ]]; then
+        local errmsg
+        errmsg=$(echo "$resp" | jq -r '.errors[0].message // "unknown registry error"' 2>/dev/null)
+        echo "ERROR:${errmsg}"
+        return
+    fi
+    # Check for non-JSON response (e.g. rate-limit HTML pages)
+    local has_layers
+    has_layers=$(echo "$resp" | jq -e '.layers' >/dev/null 2>&1 && echo "yes" || true)
+    if [[ -z "$has_layers" ]]; then
+        # Response is not a valid manifest (could be HTML or malformed JSON)
+        local snippet="${resp:0:80}"
+        echo "ERROR:invalid_manifest_response (${snippet})"
+        return
+    fi
+    echo "$resp" | jq -r '[.layers[]? | select(.mediaType | contains("model"))] | first | .digest // empty' 2>/dev/null
 }
 
 # Parse model name into library and tag
@@ -294,25 +323,41 @@ check_model_worker() {
         IFS=: read -r _ base_lib base_tag base <<< "$wmode"
         local base_local base_remote
         base_local=$(get_local_digest "$base")
-        base_remote=$(get_remote_digest "$base_lib" "$base_tag")
-        if [[ -z "$base_remote" ]]; then
-            result="SKIP|$wmodel|custom_base_not_in_registry"
-        elif [[ -n "$base_local" && "$base_local" != "$base_remote" ]]; then
-            result="UPDATE|$wmodel|custom"
-        elif [[ "$(get_local_digest "$wmodel")" != "$(get_local_digest "$base")" ]]; then
-            result="UPDATE|$wmodel|custom"
+        if [[ "$base_local" == ERROR:* ]]; then
+            result="ERROR|$wmodel|local_api_error (${base_local#ERROR:})"
         else
-            result="OK|$wmodel|custom"
+            base_remote=$(get_remote_digest "$base_lib" "$base_tag")
+            if [[ "$base_remote" == ERROR:* ]]; then
+                result="ERROR|$wmodel|registry_error (${base_remote#ERROR:})"
+            elif [[ -z "$base_remote" ]]; then
+                result="SKIP|$wmodel|custom_base_not_in_registry"
+            elif [[ -n "$base_local" && "$base_local" != "$base_remote" ]]; then
+                result="UPDATE|$wmodel|custom"
+            else
+                local custom_digest
+                custom_digest=$(get_local_digest "$wmodel")
+                if [[ "$custom_digest" == ERROR:* ]]; then
+                    result="ERROR|$wmodel|local_api_error (${custom_digest#ERROR:})"
+                elif [[ "$custom_digest" != "$base_local" ]]; then
+                    result="UPDATE|$wmodel|custom"
+                else
+                    result="OK|$wmodel|custom"
+                fi
+            fi
         fi
     else
         local local_digest remote_digest wlib wtag
         read -r wlib wtag <<< "$(parse_model "$wmodel")"
         local_digest=$(get_local_digest "$wmodel")
-        if [[ -z "$local_digest" ]]; then
+        if [[ "$local_digest" == ERROR:* ]]; then
+            result="ERROR|$wmodel|local_api_error (${local_digest#ERROR:})"
+        elif [[ -z "$local_digest" ]]; then
             result="SKIP|$wmodel|no_modelfile"
         else
             remote_digest=$(get_remote_digest "$wlib" "$wtag")
-            if [[ -z "$remote_digest" ]]; then
+            if [[ "$remote_digest" == ERROR:* ]]; then
+                result="ERROR|$wmodel|registry_error (${remote_digest#ERROR:})"
+            elif [[ -z "$remote_digest" ]]; then
                 result="SKIP|$wmodel|not_in_registry"
             elif [[ "$local_digest" == "$remote_digest" ]]; then
                 result="OK|$wmodel|"
@@ -347,6 +392,7 @@ print_result() {
 
     case "$status" in
         PIN)    echo "PIN   $model" ;;
+        ERROR)  echo "ERROR $model${reason:+ ($reason)}" ;;
         SKIP)
             case "$reason" in
                 custom_base_not_in_registry)
