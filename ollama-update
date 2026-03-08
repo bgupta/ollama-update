@@ -586,11 +586,15 @@ if $UPDATE && ! $DEFER_RELOAD && [[ ${#LOADED_MODELS[@]} -gt 0 ]]; then
     for lm_name in "${!LOADED_MODELS[@]}"; do
         was_updated=false
         for updated in "${UPDATED_BASES[@]}"; do
-            [[ "$updated" == "$lm_name" ]] && was_updated=true && break
+            if [[ "$updated" == "$lm_name" || "${updated}:latest" == "$lm_name" ]]; then
+                was_updated=true; break
+            fi
         done
         if ! $was_updated; then
             for rebuilt in "${REBUILT_CUSTOMS[@]}"; do
-                [[ "$rebuilt" == "$lm_name" ]] && was_updated=true && break
+                if [[ "$rebuilt" == "$lm_name" || "${rebuilt}:latest" == "$lm_name" ]]; then
+                    was_updated=true; break
+                fi
             done
         fi
         if $was_updated; then
