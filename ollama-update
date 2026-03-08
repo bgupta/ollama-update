@@ -93,6 +93,7 @@ Usage: ollama-update [options]
   --endpoint <url>        Ollama API endpoint (default: http://localhost:11434)
   --pin <models>          Comma-separated models to skip (pin current version)
   --jobs <N>              Parallel digest check jobs (default: unlimited)
+  -v, --version           Print version and exit
 
 Exit codes: 0 = all up to date, 1 = updates available, 2 = usage error
 HELPEOF

@@ -49,6 +49,7 @@ ollama-update --json
 | `--endpoint <url>` | Ollama API endpoint | `http://localhost:11434` |
 | `--pin <models>` | Comma-separated models to skip | (none) |
 | `--jobs <N>` | Parallel digest check jobs | unlimited (`0`) |
+| `-v`, `--version` | Print version and exit | — |
 
 ### Exit codes
 
