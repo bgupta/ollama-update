@@ -452,17 +452,8 @@ print_result() {
 export OLLAMA_ENDPOINT REGISTRY TMPDIR_CHECK
 export -f check_model_worker get_local_digest get_remote_digest parse_model portable_epoch
 
-# ── Phase 2.5: Stream results as they complete ──
-declare -A PRINTED=()
+# ── Phase 2.5: Launch parallel workers, collect results in order ──
 printed_count=0
-
-# Print "done" (pinned) results immediately — they already have temp files
-for ((j=0; j<total; j++)); do
-    [[ "${CHECK_MODES[$j]}" == "done" ]] || continue
-    print_result "$j"
-    PRINTED[$j]=1
-    printed_count=$((printed_count + 1))
-done
 
 # Background: launch workers + throttle
 (
@@ -494,23 +485,16 @@ launcher_pid=$!
 # Update trap to clean up background launcher
 trap 'kill "$launcher_pid" 2>/dev/null || true; rm -rf "$TMPDIR_CHECK"' EXIT
 
-# Foreground: print results as they appear
-while [[ $printed_count -lt $total ]]; do
-    found_any=false
-    for ((j=0; j<total; j++)); do
-        [[ -n "${PRINTED[$j]+x}" ]] && continue
-        [[ -f "${TMPDIR_CHECK}/${j}" ]] || continue
+# Wait for all workers to finish
+while [[ ! -f "${TMPDIR_CHECK}/ALL_DONE" ]]; do
+    sleep 0.05
+done
+
+# Print all results in deterministic order (sorted by model name via get_model_list)
+for ((j=0; j<total; j++)); do
+    if [[ -f "${TMPDIR_CHECK}/${j}" ]]; then
         print_result "$j"
-        PRINTED[$j]=1
         printed_count=$((printed_count + 1))
-        found_any=true
-    done
-    if [[ $printed_count -lt $total ]]; then
-        # All jobs finished but some results missing = error, stop waiting
-        if [[ -f "${TMPDIR_CHECK}/ALL_DONE" ]] && ! $found_any; then
-            break
-        fi
-        sleep 0.05
     fi
 done
 
@@ -518,7 +502,7 @@ done
 if [[ $printed_count -lt $total ]]; then
     missing=$((total - printed_count))
     for ((j=0; j<total; j++)); do
-        [[ -n "${PRINTED[$j]+x}" ]] && continue
+        [[ -f "${TMPDIR_CHECK}/${j}" ]] && continue
         model="${CHECK_MODELS[$j]}"
         RESULTS+=("ERROR|${model}|registry unreachable")
     done
