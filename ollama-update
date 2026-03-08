@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+  echo "Error: ollama-update requires bash 4.3+ (found ${BASH_VERSION})" >&2
+  echo "On macOS: brew install bash" >&2
+  exit 1
+fi
+
 # ollama-update - Check and update Ollama models, rebuild custom Modelfiles if needed
 #
 # Usage:
