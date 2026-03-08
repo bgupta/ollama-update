@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+VERSION="0.1.2"
+
 if ((BASH_VERSINFO[0] < 4)); then
   echo "Error: ollama-update requires bash 4.0+ (found ${BASH_VERSION})" >&2
   echo "On macOS: brew install bash" >&2
@@ -75,6 +77,10 @@ while [[ $i -lt ${#args[@]} ]]; do
         --json) CLI_OVERRIDE_KEYS+=("JSON"); CLI_OVERRIDE_VALS+=("true") ;;
         --quiet) CLI_OVERRIDE_KEYS+=("QUIET"); CLI_OVERRIDE_VALS+=("true") ;;
         --defer-reload) CLI_OVERRIDE_KEYS+=("DEFER_RELOAD"); CLI_OVERRIDE_VALS+=("true") ;;
+        -v|--version)
+            echo "ollama-update $VERSION"
+            exit 0
+            ;;
         -h|--help)
             cat <<'HELPEOF'
 Usage: ollama-update [options]
