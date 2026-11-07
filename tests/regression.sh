@@ -13,7 +13,12 @@ cat > "$test_dir/bin/curl" <<'MOCK'
 set -eu
 request="$*"
 case "$request" in
-    */api/tags*) echo '{"models":[{"name":"custom:latest"},{"name":"base:latest"}]}' ;;
+    */api/tags*)
+        if [[ "${HF_MODEL:-0}" == 1 ]]; then
+            echo '{"models":[{"name":"hf.co/org/repo-GGUF:q4_K_M"}]}'
+        else
+            echo '{"models":[{"name":"custom:latest"},{"name":"base:latest"}]}'
+        fi ;;
     */api/ps*) echo '{"models":[]}' ;;
     */api/show*)
         if [[ "$request" == *'"name":"custom'* ]]; then
@@ -26,8 +31,10 @@ case "$request" in
             echo '{"modelfile":"FROM /blobs/sha256-bbbb"}'
         fi ;;
     */manifests/*)
+        echo "$request" >> "$TEST_DIR/requests"
         case "${REGISTRY_STATUS:-200}" in
-            200) printf '%s\n200' '{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:bbbb"}]}' ;;
+            200) printf '{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:%s"}]}\n200' "${MANIFEST_DIGEST:-bbbb}" ;;
+            401) printf '%s\n401' '{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}' ;;
             404) printf '%s\n404' '{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown"}]}' ;;
             500) printf 'server error\n500' ;;
         esac ;;
@@ -93,4 +100,26 @@ unset CREATE_FAIL
 echo 'FROM /models/local.gguf' > "$test_dir/models/Modelfile-custom"
 run_check 0
 grep -q 'custom: local file base' "$test_dir/output"
+
+# Hugging Face models are checked against huggingface.co manifests.
+export HF_MODEL=1
+: > "$test_dir/requests"
+run_check 0
+grep -q 'https://huggingface.co/v2/org/repo-GGUF/manifests/q4_K_M' "$test_dir/requests"
+grep -q '^OK *hf.co/org/repo-GGUF:q4_K_M' "$test_dir/output"
+export MANIFEST_DIGEST=cccc
+run_check 1
+grep -q '^UPDATE *hf.co/org/repo-GGUF:q4_K_M' "$test_dir/output"
+unset MANIFEST_DIGEST
+
+# Hugging Face answers 401 for missing, private and gated repos: skip it.
+export REGISTRY_STATUS=401
+run_check 0
+grep -q 'not in registry, or private/gated' "$test_dir/output"
+unset HF_MODEL
+
+# A 401 from the Ollama registry is still an error.
+run_check 2
+grep -q 'registry_http_401' "$test_dir/output"
+unset REGISTRY_STATUS
 echo 'Regression checks passed.'

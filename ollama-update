@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.1.9"
+VERSION="0.1.10"
 
 if ((BASH_VERSINFO[0] < 4)); then
   echo "Error: ollama-update requires bash 4.0+ (found ${BASH_VERSION})" >&2
@@ -181,10 +181,12 @@ get_local_digest() {
 # Returns: digest string, empty string (not in registry), or "ERROR:<message>" on API error
 get_remote_digest() {
     local lib="$1" tag="$2"
-    # Hugging Face models do not use the Ollama registry manifest API.
-    [[ "$lib" == hf.co/* || "$lib" == huggingface.co/* ]] && return 0
-    local url
-    if [[ "$lib" == *"/"* ]]; then
+    local url is_hf=false
+    if [[ "$lib" == hf.co/* || "$lib" == huggingface.co/* ]]; then
+        # Hugging Face serves Ollama-format manifests for GGUF repos.
+        is_hf=true
+        url="https://huggingface.co/v2/${lib#*/}/manifests/${tag}"
+    elif [[ "$lib" == *"/"* ]]; then
         url="https://registry.ollama.ai/v2/${lib}/manifests/${tag}"
     else
         url="${REGISTRY}/${lib}/manifests/${tag}"
@@ -197,6 +199,10 @@ get_remote_digest() {
     resp="${resp%$'\n'*}"
     # A removed/private tag is unavailable, not a failed update check.
     [[ "$http_status" == 404 ]] && return 0
+    # Hugging Face answers 401 for missing, private and gated repos alike.
+    if $is_hf && [[ "$http_status" == 401 ]]; then
+        return 0
+    fi
     if [[ "$http_status" != 200 ]]; then
         echo "ERROR:registry_http_${http_status}"
         return
@@ -429,13 +435,13 @@ print_result() {
                 custom_base_not_in_registry)
                     if [[ "${CHECK_MODES[$j]}" == custom:* ]]; then
                         IFS=: read -r _ _ _ base <<< "${CHECK_MODES[$j]}"
-                        echo "SKIP  $model (custom: base $base not in registry)"
+                        echo "SKIP  $model (custom: base $base not in registry, or private/gated)"
                     else
                         echo "SKIP  $model ($reason)"
                     fi
                     ;;
                 no_modelfile) echo "SKIP  $model (unknown, no modelfile)" ;;
-                not_in_registry) echo "SKIP  $model (not in registry)" ;;
+                not_in_registry) echo "SKIP  $model (not in registry, or private/gated)" ;;
                 *) echo "SKIP  $model${reason:+ ($reason)}" ;;
             esac
             ;;

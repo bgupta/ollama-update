@@ -131,7 +131,7 @@ If you use `ollama create` with custom Modelfiles (system prompts, parameters, e
 
 When a base model gets an upstream update, the script detects the digest mismatch and rebuilds your custom model automatically.
 
-Modelfile names must match valid Ollama model names (at most one `:` to separate the tag). Custom models whose `FROM` points to a local file are skipped because they have no registry version to compare. Missing registry tags and Hugging Face models are also skipped; Hugging Face update checks are not supported.
+Modelfile names must match valid Ollama model names (at most one `:` to separate the tag). Custom models whose `FROM` points to a local file are skipped because they have no registry version to compare. Models whose registry tag is missing, private or gated are also skipped.
 
 If only the custom model's weights are stale, the script rebuilds it from the installed base without pulling that base again. Invalid custom model names and rebuild failures are reported as errors while other custom models continue processing.
 
@@ -165,12 +165,14 @@ Use `--defer-reload` to skip this — updated models will cold-load on next use 
 
 1. Discovers installed models via the Ollama HTTP API (`/api/tags`)
 2. For each model, extracts the local weight blob digest via `/api/show`
-3. Fetches the registry manifest from `registry.ollama.ai` and extracts the remote digest
+3. Fetches the registry manifest from `registry.ollama.ai` (or from `huggingface.co` for `hf.co/...` models) and extracts the remote digest
 4. Compares digests — if they differ, the model has an update
 5. For custom Modelfile-based models, checks both the base model's registry digest *and* whether the custom model's blob matches its base
 6. With `--update`: pulls changed models, rebuilds custom Modelfiles, reloads VRAM
 
-The registry is always `registry.ollama.ai` regardless of your local endpoint setting — the endpoint only controls where `ollama pull` and VRAM operations target.
+The registry is always `registry.ollama.ai` (or `huggingface.co` for `hf.co/...` models) regardless of your local endpoint setting — the endpoint only controls where `ollama pull` and VRAM operations target.
+
+Hugging Face models pulled as `hf.co/<user>/<repo>:<quant>` are checked against Hugging Face's Ollama-compatible manifest endpoint. Hugging Face returns 401 for missing, private and gated repos alike, so those are reported as `SKIP` rather than checked; authenticated checks are not supported.
 
 ## Contributing
 
