@@ -2,6 +2,8 @@
 
 Check for Ollama model updates **without pulling** — by comparing local digests against the registry manifest. Only pulls when there's actually an update.
 
+![ollama-update checking 10 models against the registry: 8 up to date, 2 with updates, exit code 1](docs/demo.gif)
+
 ## Why?
 
 If you manage dozens of models, pulling each one just to check for updates wastes time and bandwidth. This script queries the registry first, so you get a fast dry-run view of what's outdated before committing to any downloads.
@@ -89,6 +91,16 @@ cd ollama-update && git pull
 ```
 
 **Requirements:** `bash` 4.0+, `curl`, `jq`, `ollama`
+
+## Running from cron
+
+Because the exit codes signal whether updates exist, the script works well on a schedule. To apply updates nightly on Linux, wrap it in `flock` so a long pull can't overlap the next run:
+
+```cron
+0 4 * * * flock -n /tmp/ollama-update.lock ollama-update --update --quiet
+```
+
+cron runs with a minimal `PATH`, so use absolute paths (or set `PATH=` at the top of the crontab) if `ollama-update`, `jq` or `ollama` live outside `/usr/bin`. `flock` ships with util-linux on Linux; on macOS, `brew install flock` provides it.
 
 ## Platform support
 
