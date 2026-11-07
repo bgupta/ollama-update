@@ -16,8 +16,9 @@ If you manage dozens of models, pulling each one just to check for updates waste
 - **Pinned models** — skip specific models you don't want touched
 - **Config file** — persistent settings without editing the script
 - **Remote endpoint** — manage models on any Ollama instance
+- **Hugging Face models** — `hf.co/...` models are checked against Hugging Face's manifests too
 - **JSON output** — machine-readable results for scripting/CI
-- **CI-friendly exit codes** — `0` all up to date, `1` updates available, `2` usage error
+- **CI-friendly exit codes** — `0` all up to date, `1` updates available, `2` error
 
 ## Quick start
 
