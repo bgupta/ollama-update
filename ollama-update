@@ -155,7 +155,7 @@ TMPDIR_CHECK=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_CHECK"' EXIT
 
 # Snapshot currently loaded models: name -> expires_at (ISO timestamp)
-declare -A LOADED_MODELS
+declare -A LOADED_MODELS=()
 while IFS=$'\t' read -r lm_name lm_expires; do
     LOADED_MODELS["$lm_name"]="$lm_expires"
 done < <(curl -s "${OLLAMA_ENDPOINT}/api/ps" 2>/dev/null \
@@ -244,7 +244,7 @@ portable_epoch() {
 }
 
 # Build map of custom Modelfiles: custom_name -> base_model
-declare -A CUSTOM_MODELS
+declare -A CUSTOM_MODELS=()
 if [[ -d "$MODELFILE_DIR" ]]; then
     for mf in "$MODELFILE_DIR"/Modelfile-*; do
         [[ -f "$mf" ]] || continue
