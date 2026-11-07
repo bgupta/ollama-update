@@ -57,17 +57,20 @@ run_check() {
 
 # Stale custom weights trigger a rebuild without a redundant base pull.
 run_check 0 --update
-rg -q '^create custom ' "$test_dir/actions"
-! rg -q '^pull ' "$test_dir/actions"
-rg -q 'rebuild needed from base' "$test_dir/output"
+grep -q '^create custom ' "$test_dir/actions"
+if grep -q '^pull ' "$test_dir/actions"; then
+    echo 'Unexpected base pull for a stale custom model' >&2
+    exit 1
+fi
+grep -q 'rebuild needed from base' "$test_dir/output"
 
 # Missing manifests are expected skips; server failures remain errors.
 export REGISTRY_STATUS=404
 run_check 0
-rg -q 'not in registry' "$test_dir/output"
+grep -q 'not in registry' "$test_dir/output"
 export REGISTRY_STATUS=500
 run_check 2
-rg -q 'registry_http_500' "$test_dir/output"
+grep -q 'registry_http_500' "$test_dir/output"
 unset REGISTRY_STATUS
 
 # API errors must never be mistaken for different weight digests.
@@ -79,15 +82,15 @@ unset SHOW_ERROR
 # A malformed filename or failed rebuild must not abort other rebuilds.
 echo 'FROM base:latest' > "$test_dir/models/Modelfile-bad:name:tag"
 run_check 2 --update
-rg -q 'invalid model name in Modelfile filename' "$test_dir/output"
-rg -q '^create custom ' "$test_dir/actions"
+grep -q 'invalid model name in Modelfile filename' "$test_dir/output"
+grep -q '^create custom ' "$test_dir/actions"
 export CREATE_FAIL=1
 run_check 2 --update
-rg -q 'rebuild failed' "$test_dir/output"
+grep -q 'rebuild failed' "$test_dir/output"
 unset CREATE_FAIL
 
 # Local file bases are skipped instead of being passed to /api/show.
 echo 'FROM /models/local.gguf' > "$test_dir/models/Modelfile-custom"
 run_check 0
-rg -q 'custom: local file base' "$test_dir/output"
+grep -q 'custom: local file base' "$test_dir/output"
 echo 'Regression checks passed.'
