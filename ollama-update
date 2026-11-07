@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.1.8"
+VERSION="0.1.9"
 
 if ((BASH_VERSINFO[0] < 4)); then
   echo "Error: ollama-update requires bash 4.0+ (found ${BASH_VERSION})" >&2
@@ -181,16 +181,26 @@ get_local_digest() {
 # Returns: digest string, empty string (not in registry), or "ERROR:<message>" on API error
 get_remote_digest() {
     local lib="$1" tag="$2"
+    # Hugging Face models do not use the Ollama registry manifest API.
+    [[ "$lib" == hf.co/* || "$lib" == huggingface.co/* ]] && return 0
     local url
     if [[ "$lib" == *"/"* ]]; then
         url="https://registry.ollama.ai/v2/${lib}/manifests/${tag}"
     else
         url="${REGISTRY}/${lib}/manifests/${tag}"
     fi
-    local resp
-    resp=$(curl -s --max-time 10 \
+    local resp http_status
+    resp=$(curl -s --max-time 10 -w $'\n%{http_code}' \
         -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
         "$url" 2>/dev/null) || { echo "ERROR:registry_request_failed"; return; }
+    http_status="${resp##*$'\n'}"
+    resp="${resp%$'\n'*}"
+    # A removed/private tag is unavailable, not a failed update check.
+    [[ "$http_status" == 404 ]] && return 0
+    if [[ "$http_status" != 200 ]]; then
+        echo "ERROR:registry_http_${http_status}"
+        return
+    fi
     # Check for Docker registry error response (e.g. {"errors":[...]})
     local has_errors
     has_errors=$(echo "$resp" | jq -r '.errors // empty | if length > 0 then "yes" else empty end' 2>/dev/null)
@@ -311,6 +321,13 @@ while IFS= read -r model; do
     fi
     if [[ -n "$custom_key" ]]; then
         base="${CUSTOM_MODELS[$custom_key]}"
+        if [[ "$base" == /* || "$base" == ./* || "$base" == ../* ]]; then
+            echo "SKIP|$model|custom_local_file" > "${TMPDIR_CHECK}/${idx}"
+            CHECK_MODELS[$idx]="$model"
+            CHECK_MODES[$idx]="done"
+            idx=$((idx + 1))
+            continue
+        fi
         read -r base_lib base_tag <<< "$(parse_model "$base")"
         CHECK_MODELS[$idx]="$model"
         CHECK_MODES[$idx]="custom:${base_lib}:${base_tag}:${base}"
@@ -352,7 +369,7 @@ check_model_worker() {
                 if [[ "$custom_digest" == ERROR:* ]]; then
                     result="ERROR|$wmodel|local_api_error (${custom_digest#ERROR:})"
                 elif [[ "$custom_digest" != "$base_local" ]]; then
-                    result="UPDATE|$wmodel|custom"
+                    result="UPDATE|$wmodel|custom_stale"
                 else
                     result="OK|$wmodel|custom"
                 fi
@@ -408,6 +425,7 @@ print_result() {
         ERROR)  echo "ERROR $model${reason:+ ($reason)}" ;;
         SKIP)
             case "$reason" in
+                custom_local_file) echo "SKIP  $model (custom: local file base)" ;;
                 custom_base_not_in_registry)
                     if [[ "${CHECK_MODES[$j]}" == custom:* ]]; then
                         IFS=: read -r _ _ _ base <<< "${CHECK_MODES[$j]}"
@@ -434,10 +452,14 @@ print_result() {
             fi
             ;;
         UPDATE)
-            if [[ "$reason" == "custom" ]]; then
+            if [[ "$reason" == "custom" || "$reason" == "custom_stale" ]]; then
                 if [[ "${CHECK_MODES[$j]}" == custom:* ]]; then
                     IFS=: read -r _ _ _ base <<< "${CHECK_MODES[$j]}"
-                    echo "UPDATE $model (custom: base $base has update)"
+                    if [[ "$reason" == "custom_stale" ]]; then
+                        echo "UPDATE $model (custom: rebuild needed from base $base)"
+                    else
+                        echo "UPDATE $model (custom: base $base has update)"
+                    fi
                 else
                     echo "UPDATE $model (custom)"
                 fi
@@ -516,6 +538,8 @@ if $UPDATE; then
     for r in "${RESULTS[@]}"; do
         IFS='|' read -r status model reason <<< "$r"
         [[ "$status" == "UPDATE" ]] || continue
+        # The base is current; only the derived model needs rebuilding.
+        [[ "$reason" == "custom_stale" ]] && continue
 
         # Find the CHECK_MODES index for this model to get custom base info
         for ((j=0; j<total; j++)); do
@@ -541,6 +565,14 @@ if $UPDATE && [[ ${#CUSTOM_MODELS[@]} -gt 0 ]]; then
     echo "Checking custom Modelfiles..."
     for custom_name in "${!CUSTOM_MODELS[@]}"; do
         base="${CUSTOM_MODELS[$custom_name]}"
+        # Local GGUF bases cannot be checked against the registry.
+        [[ "$base" == /* || "$base" == ./* || "$base" == ../* ]] && continue
+        # A model may have at most one colon (the tag separator).
+        if [[ "$custom_name" == *:*:* ]]; then
+            echo "  ERROR $custom_name: invalid model name in Modelfile filename"
+            RESULTS+=("ERROR|$custom_name|invalid_custom_model_name")
+            continue
+        fi
         needs_rebuild=false
 
         # Check if the base model was just updated
@@ -556,6 +588,11 @@ if $UPDATE && [[ ${#CUSTOM_MODELS[@]} -gt 0 ]]; then
         if ! $needs_rebuild; then
             custom_blob=$(get_local_digest "$custom_name" 2>/dev/null)
             base_blob=$(get_local_digest "$base" 2>/dev/null)
+            if [[ "$custom_blob" == ERROR:* || "$base_blob" == ERROR:* ]]; then
+                echo "  ERROR $custom_name: cannot compare custom and base weights"
+                RESULTS+=("ERROR|$custom_name|rebuild_digest_check_failed")
+                continue
+            fi
             if [[ -n "$custom_blob" && -n "$base_blob" && "$custom_blob" != "$base_blob" ]]; then
                 needs_rebuild=true
                 echo "  $custom_name: base model $base has newer weights than custom model"
@@ -566,8 +603,12 @@ if $UPDATE && [[ ${#CUSTOM_MODELS[@]} -gt 0 ]]; then
             mf="$MODELFILE_DIR/Modelfile-${custom_name}"
             if [[ -f "$mf" ]]; then
                 echo "  -> Rebuilding $custom_name from $mf..."
-                ollama create "$custom_name" -f "$mf"
-                REBUILT_CUSTOMS+=("$custom_name")
+                if ollama create "$custom_name" -f "$mf"; then
+                    REBUILT_CUSTOMS+=("$custom_name")
+                else
+                    RESULTS+=("ERROR|$custom_name|rebuild_failed")
+                    echo "  ERROR $custom_name: rebuild failed"
+                fi
             else
                 echo "  WARN: No Modelfile found at $mf for $custom_name"
             fi

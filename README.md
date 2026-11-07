@@ -131,6 +131,10 @@ If you use `ollama create` with custom Modelfiles (system prompts, parameters, e
 
 When a base model gets an upstream update, the script detects the digest mismatch and rebuilds your custom model automatically.
 
+Modelfile names must match valid Ollama model names (at most one `:` to separate the tag). Custom models whose `FROM` points to a local file are skipped because they have no registry version to compare. Missing registry tags and Hugging Face models are also skipped; Hugging Face update checks are not supported.
+
+If only the custom model's weights are stale, the script rebuilds it from the installed base without pulling that base again. Invalid custom model names and rebuild failures are reported as errors while other custom models continue processing.
+
 ## Output
 
 ```
@@ -169,6 +173,8 @@ Use `--defer-reload` to skip this — updated models will cold-load on next use 
 The registry is always `registry.ollama.ai` regardless of your local endpoint setting — the endpoint only controls where `ollama pull` and VRAM operations target.
 
 ## Contributing
+
+Run `bash -n ollama-update` and `bash tests/regression.sh` to validate changes. The regression checks use mocked commands and do not contact Ollama or download models.
 
 Feature requests and bug reports are welcome — please [open an issue](https://github.com/bgupta/ollama-update/issues).
 
